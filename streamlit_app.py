@@ -2,9 +2,9 @@
 Altermagnet Screener — Streamlit app (Materials Project integration)
 ------------------------------------------------------------------
 Search structures directly from the Materials Project database, or upload
-your own VASP files, then this app drives `amcheck` (in parallel) across
-every u/d spin combination for magnetic elements, flagging any structure
-where at least one combination reports `Altermagnet? True`.
+your own VASP files, then this app drives `amcheck` across every u/d spin
+combination for magnetic elements, flagging any structure where at least
+one combination reports `Altermagnet? True`.
 
 Performance notes vs. the original version:
   * amcheck availability check is cached (st.cache_resource) instead of
@@ -18,6 +18,7 @@ Performance notes vs. the original version:
 
 import collections
 import itertools
+import json
 import os
 import re
 import shutil
@@ -29,6 +30,7 @@ import zipfile
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # --------------------------------------------------------------------------
 # Constants
@@ -132,6 +134,58 @@ def mp_search(api_key: str, mode: str, query: str):
 def structure_to_poscar_text(structure) -> str:
     from pymatgen.io.vasp import Poscar
     return Poscar(structure).get_string()
+
+
+def structure_to_cif_text(structure) -> str:
+    from pymatgen.io.cif import CifWriter
+    return str(CifWriter(structure))
+
+
+def render_structure_viewer(cif_text: str, key: str, height: int = 380):
+    """Renders an interactive, rotatable/zoomable 3D structure using 3Dmol.js.
+
+    Runs entirely client-side in the browser (loaded from a CDN), so there's
+    no extra Python dependency or server load beyond generating the CIF text.
+    """
+    div_id = "am_viewer_" + re.sub(r"[^a-zA-Z0-9_]", "_", key)
+    cif_json = json.dumps(cif_text)
+
+    html = f"""
+    <div id="{div_id}" style="
+        height: {height}px; width: 100%; position: relative;
+        border-radius: 12px; overflow: hidden;
+        background: radial-gradient(circle at 30% 20%, #1b1f2e 0%, #0d1117 70%);
+        border: 1px solid #30363d;
+    "></div>
+    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+    <script>
+      (function() {{
+        var cifData = {cif_json};
+        var el = document.getElementById("{div_id}");
+        try {{
+          var viewer = $3Dmol.createViewer(el, {{backgroundColor: "transparent"}});
+          viewer.addModel(cifData, "cif");
+          viewer.setStyle({{}}, {{
+            sphere: {{scale: 0.28, colorscheme: "Jmol"}},
+            stick: {{radius: 0.11, colorscheme: "Jmol"}}
+          }});
+          viewer.addUnitCell({{
+            box: {{color: "#7c3aed", linewidth: 1.5}},
+            alabel: false, blabel: false, clabel: false
+          }});
+          viewer.zoomTo();
+          viewer.zoom(1.15);
+          viewer.spin(false);
+          viewer.render();
+          el.addEventListener("dblclick", function() {{ viewer.spin("y", 1); }});
+        }} catch (err) {{
+          el.innerHTML = "<div style='color:#f87171;padding:1rem;font-family:sans-serif;'>"
+            + "Couldn't render structure: " + err + "</div>";
+        }}
+      }})();
+    </script>
+    """
+    components.html(html, height=height + 16)
 
 
 # --------------------------------------------------------------------------
@@ -457,6 +511,35 @@ st.markdown(
     .badge-flagged {background: rgba(219, 39, 119, 0.15); color: #db2777; border: 1px solid rgba(219,39,119,0.35);}
     .badge-clean {background: rgba(16, 185, 129, 0.12); color: #059669; border: 1px solid rgba(16,185,129,0.3);}
     .badge-error {background: rgba(239, 68, 68, 0.12); color: #dc2626; border: 1px solid rgba(239,68,68,0.3);}
+
+    /* Materials Project result cards */
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 14px !important;
+        transition: box-shadow 0.18s ease, border-color 0.18s ease;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:hover {
+        box-shadow: 0 6px 22px rgba(124, 58, 237, 0.16);
+        border-color: rgba(124, 58, 237, 0.35) !important;
+    }
+    .mat-id {
+        font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+        font-size: 0.82rem;
+        background: rgba(124, 58, 237, 0.12);
+        color: #7c3aed;
+        padding: 0.08rem 0.5rem;
+        border-radius: 6px;
+        margin-left: 0.4rem;
+    }
+    .queued-pill {
+        display: inline-block;
+        background: rgba(16, 185, 129, 0.12);
+        color: #059669;
+        border: 1px solid rgba(16,185,129,0.3);
+        border-radius: 999px;
+        padding: 0.2rem 0.7rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -467,9 +550,9 @@ st.markdown(
     <div class="am-hero">
         <h1>🧲 Altermagnet Screener</h1>
         <p>Search a structure from the Materials Project, or upload your own VASP files.
-        This app runs <code>amcheck</code> in parallel across every u/d spin combination
-        for magnetic elements and flags any structure with at least one combination
-        where <b>Altermagnet? True</b>.</p>
+        Click any result to view it in 3D and add it to the queue — then run
+        <code>amcheck</code> across every u/d spin combination for magnetic elements,
+        and get flagged the moment one comes back <b>Altermagnet? True</b>.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -545,42 +628,59 @@ with tab_mp:
                 st.error(f"Search failed: {e}")
 
     if st.session_state.mp_docs:
-        table_rows = []
+        st.markdown(f"#### Results — {len(st.session_state.mp_docs)} structure(s)")
+        st.caption("Click **🔬 View structure** on any card to rotate/zoom it in 3D, or **➕ Add** to queue it directly — no dropdown needed.")
+
+        queued_ids = {q["material_id"] for q in st.session_state.mp_queue}
+
         for mid, d in st.session_state.mp_docs.items():
-            table_rows.append({
-                "Material ID": str(mid),
-                "Formula": d.formula_pretty,
-                "Spacegroup": getattr(d.symmetry, "symbol", "—") if d.symmetry else "—",
-                "Energy above hull (eV/atom)": round(d.energy_above_hull, 4) if d.energy_above_hull is not None else None,
-                "Sites": d.nsites,
-            })
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+            mid_str = str(mid)
+            sg = getattr(d.symmetry, "symbol", "—") if d.symmetry else "—"
+            eah = f"{d.energy_above_hull:.4f} eV/atom" if d.energy_above_hull is not None else "—"
+            is_queued = mid_str in queued_ids
 
-        options = [f"{mid} — {d.formula_pretty}" for mid, d in st.session_state.mp_docs.items()]
-        selected = st.multiselect("Select structure(s) to add to the analysis queue", options)
+            with st.container(border=True):
+                head_col, action_col = st.columns([4, 1])
+                with head_col:
+                    st.markdown(
+                        f"**{d.formula_pretty}**<span class='mat-id'>{mid_str}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"Spacegroup {sg}  •  {d.nsites} sites  •  E above hull: {eah}")
+                with action_col:
+                    if is_queued:
+                        st.markdown(
+                            "<div style='text-align:right;padding-top:0.4rem;'>"
+                            "<span class='queued-pill'>✓ Queued</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        if st.button("➕ Add", key=f"add_{mid_str}", use_container_width=True):
+                            poscar_text = structure_to_poscar_text(d.structure)
+                            st.session_state.mp_queue.append({
+                                "material_id": mid_str,
+                                "formula": d.formula_pretty,
+                                "poscar_text": poscar_text,
+                            })
+                            st.rerun()
 
-        if st.button("➕ Add selected to queue", disabled=not selected):
-            for opt in selected:
-                mid = opt.split(" — ")[0]
-                doc = st.session_state.mp_docs[mid]
-                poscar_text = structure_to_poscar_text(doc.structure)
-                already_queued = any(q["material_id"] == mid for q in st.session_state.mp_queue)
-                if not already_queued:
-                    st.session_state.mp_queue.append({
-                        "material_id": mid,
-                        "formula": doc.formula_pretty,
-                        "poscar_text": poscar_text,
-                    })
-            st.rerun()
+                with st.expander(f"🔬 View structure — {mid_str}"):
+                    cif_text = structure_to_cif_text(d.structure)
+                    render_structure_viewer(cif_text, key=mid_str)
+                    st.caption("Drag to rotate • scroll to zoom • double-click to spin")
 
     if st.session_state.mp_queue:
-        st.write("**Queued from Materials Project:**")
+        st.markdown(f"##### 📋 Queued from Materials Project ({len(st.session_state.mp_queue)})")
         for i, item in enumerate(st.session_state.mp_queue):
-            c1, c2 = st.columns([5, 1])
-            c1.write(f"`{item['material_id']}` — {item['formula']}")
-            if c2.button("Remove", key=f"remove_mp_{i}"):
-                st.session_state.mp_queue.pop(i)
-                st.rerun()
+            with st.container(border=True):
+                c1, c2 = st.columns([5, 1])
+                c1.markdown(
+                    f"**{item['formula']}**<span class='mat-id'>{item['material_id']}</span>",
+                    unsafe_allow_html=True,
+                )
+                if c2.button("🗑 Remove", key=f"remove_mp_{i}", use_container_width=True):
+                    st.session_state.mp_queue.pop(i)
+                    st.rerun()
 
 with tab_upload:
     uploaded_files = st.file_uploader(
