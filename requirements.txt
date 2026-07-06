@@ -1,2 +1,4 @@
 streamlit
 amcheck
+mp-api
+pymatgen
