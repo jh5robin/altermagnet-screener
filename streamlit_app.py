@@ -18,7 +18,6 @@ Performance notes vs. the original version:
 
 import collections
 import itertools
-import json
 import os
 import re
 import shutil
@@ -30,7 +29,6 @@ import zipfile
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 # --------------------------------------------------------------------------
 # Constants
@@ -145,58 +143,6 @@ def get_saved_mp_api_key() -> str:
         return st.secrets.get("MP_API_KEY", "")
     except Exception:
         return ""
-
-
-def structure_to_cif_text(structure) -> str:
-    from pymatgen.io.cif import CifWriter
-    return str(CifWriter(structure))
-
-
-def render_structure_viewer(cif_text: str, key: str, height: int = 380):
-    """Renders an interactive, rotatable/zoomable 3D structure using 3Dmol.js.
-
-    Runs entirely client-side in the browser (loaded from a CDN), so there's
-    no extra Python dependency or server load beyond generating the CIF text.
-    """
-    div_id = "am_viewer_" + re.sub(r"[^a-zA-Z0-9_]", "_", key)
-    cif_json = json.dumps(cif_text)
-
-    html = f"""
-    <div id="{div_id}" style="
-        height: {height}px; width: 100%; position: relative;
-        border-radius: 12px; overflow: hidden;
-        background: radial-gradient(circle at 30% 20%, #1b1f2e 0%, #0d1117 70%);
-        border: 1px solid #30363d;
-    "></div>
-    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-    <script>
-      (function() {{
-        var cifData = {cif_json};
-        var el = document.getElementById("{div_id}");
-        try {{
-          var viewer = $3Dmol.createViewer(el, {{backgroundColor: "transparent"}});
-          viewer.addModel(cifData, "cif");
-          viewer.setStyle({{}}, {{
-            sphere: {{scale: 0.28, colorscheme: "Jmol"}},
-            stick: {{radius: 0.11, colorscheme: "Jmol"}}
-          }});
-          viewer.addUnitCell({{
-            box: {{color: "#7c3aed", linewidth: 1.5}},
-            alabel: false, blabel: false, clabel: false
-          }});
-          viewer.zoomTo();
-          viewer.zoom(1.15);
-          viewer.spin(false);
-          viewer.render();
-          el.addEventListener("dblclick", function() {{ viewer.spin("y", 1); }});
-        }} catch (err) {{
-          el.innerHTML = "<div style='color:#f87171;padding:1rem;font-family:sans-serif;'>"
-            + "Couldn't render structure: " + err + "</div>";
-        }}
-      }})();
-    </script>
-    """
-    components.html(html, height=height + 16)
 
 
 # --------------------------------------------------------------------------
@@ -645,45 +591,56 @@ with tab_mp:
 
     if st.session_state.mp_docs:
         st.markdown(f"#### Results — {len(st.session_state.mp_docs)} structure(s)")
-        st.caption("Click **🔬 View structure** on any card to rotate/zoom it in 3D, or **➕ Add** to queue it directly — no dropdown needed.")
+        st.caption("Click row(s) below to select them, then **Add selected to queue** — no dropdown needed.")
 
+        mp_docs_list = list(st.session_state.mp_docs.items())  # [(mid, doc), ...] — stable order
         queued_ids = {q["material_id"] for q in st.session_state.mp_queue}
 
-        for mid, d in st.session_state.mp_docs.items():
+        table_rows = []
+        for mid, d in mp_docs_list:
             mid_str = str(mid)
             sg = getattr(d.symmetry, "symbol", "—") if d.symmetry else "—"
-            eah = f"{d.energy_above_hull:.4f} eV/atom" if d.energy_above_hull is not None else "—"
-            is_queued = mid_str in queued_ids
+            eah = round(d.energy_above_hull, 4) if d.energy_above_hull is not None else None
+            table_rows.append({
+                "Material ID": mid_str,
+                "Formula": d.formula_pretty,
+                "Spacegroup": sg,
+                "Sites": d.nsites,
+                "E above hull (eV/atom)": eah,
+                "Queued": "✓" if mid_str in queued_ids else "",
+            })
+        results_df = pd.DataFrame(table_rows)
 
-            with st.container(border=True):
-                head_col, action_col = st.columns([4, 1])
-                with head_col:
-                    st.markdown(
-                        f"**{d.formula_pretty}**<span class='mat-id'>{mid_str}</span>",
-                        unsafe_allow_html=True,
-                    )
-                    st.caption(f"Spacegroup {sg}  •  {d.nsites} sites  •  E above hull: {eah}")
-                with action_col:
-                    if is_queued:
-                        st.markdown(
-                            "<div style='text-align:right;padding-top:0.4rem;'>"
-                            "<span class='queued-pill'>✓ Queued</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        if st.button("➕ Add", key=f"add_{mid_str}", use_container_width=True):
-                            poscar_text = structure_to_poscar_text(d.structure)
-                            st.session_state.mp_queue.append({
-                                "material_id": mid_str,
-                                "formula": d.formula_pretty,
-                                "poscar_text": poscar_text,
-                            })
-                            st.rerun()
+        selection_event = st.dataframe(
+            results_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="multi-row",
+            key="mp_results_table",
+        )
 
-                with st.expander(f"🔬 Structure — {mid_str}", expanded=False):
-                    cif_text = structure_to_cif_text(d.structure)
-                    render_structure_viewer(cif_text, key=mid_str)
-                    st.caption("Rendered directly from the Materials Project structure data • drag to rotate • scroll to zoom • double-click to spin")
+        try:
+            selected_positions = list(selection_event.selection.rows)
+        except Exception:
+            selected_positions = []
+
+        if st.button("➕ Add selected to queue", disabled=not selected_positions):
+            added = 0
+            for pos in selected_positions:
+                mid, d = mp_docs_list[pos]
+                mid_str = str(mid)
+                if mid_str not in queued_ids:
+                    poscar_text = structure_to_poscar_text(d.structure)
+                    st.session_state.mp_queue.append({
+                        "material_id": mid_str,
+                        "formula": d.formula_pretty,
+                        "poscar_text": poscar_text,
+                    })
+                    added += 1
+            if added:
+                st.success(f"Added {added} structure(s) to the queue.")
+            st.rerun()
 
     if st.session_state.mp_queue:
         st.markdown(f"##### 📋 Queued from Materials Project ({len(st.session_state.mp_queue)})")
