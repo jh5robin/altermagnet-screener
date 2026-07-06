@@ -9,12 +9,11 @@ where at least one combination reports `Altermagnet? True`.
 Performance notes vs. the original version:
   * amcheck availability check is cached (st.cache_resource) instead of
     re-spawning a subprocess on every Streamlit rerun.
-  * amcheck runs for different u/d combinations are executed concurrently
-    with a thread pool (subprocess.Popen releases the GIL while waiting on
-    I/O, so this gives a near-linear speedup with worker count).
   * Live terminal output is throttled (batched by line-count + time) and
     kept in a bounded deque, instead of re-joining/re-escaping the full
     scrollback on every single printed line.
+  * amcheck combinations still run sequentially, one at a time, in the same
+    order as the original script.
 """
 
 import collections
@@ -27,7 +26,6 @@ import tempfile
 import threading
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -51,8 +49,6 @@ SUBPROCESS_TIMEOUT_SECONDS = 120
 TERMINAL_MAX_LINES = 500
 TERMINAL_FLUSH_EVERY_N_LINES = 15
 TERMINAL_FLUSH_EVERY_SECONDS = 0.35
-
-DEFAULT_MAX_WORKERS = 4
 
 
 # --------------------------------------------------------------------------
@@ -312,48 +308,31 @@ def run_amcheck(vasp_file_path: str, input_array: list, stream_cb=None):
     return altermagnet_result["value"], run_result
 
 
-def generate_input_combinations(vasp_file_path, arr, max_workers, stream_cb=None, progress_cb=None):
-    """Runs every u/d combination concurrently via a thread pool.
-
-    subprocess.Popen blocks on I/O (waiting for the child process), which
-    releases the GIL, so a thread pool gives real parallel speedup here even
-    though Python threads don't parallelize pure-CPU work.
-    """
+def generate_input_combinations(vasp_file_path, arr, stream_cb=None, progress_cb=None):
+    """Runs every u/d combination one at a time, in order."""
     combos = list(itertools.product(*arr)) if arr else [()]
     total_combos = len(combos)
 
-    counters = {"done": 0, "true_count": 0, "errors": 0}
-    counters_lock = threading.Lock()
+    total = 0
+    true_count = 0
+    errors = 0
 
-    def _run_one(combo):
+    for combo in combos:
+        total += 1
         output, run_result = run_amcheck(vasp_file_path, list(combo), stream_cb)
-        is_error = bool(
-            run_result.exception or run_result.timed_out or (
-                run_result.returncode not in (0, None) and output is None
-            )
-        )
-        return output, is_error
+        if output == "True":
+            true_count += 1
+        if run_result.exception or run_result.timed_out or (
+            run_result.returncode not in (0, None) and output is None
+        ):
+            errors += 1
+        if progress_cb:
+            progress_cb(total, total_combos, true_count, errors)
 
-    workers = max(1, min(max_workers, total_combos))
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_run_one, combo): combo for combo in combos}
-        for future in as_completed(futures):
-            output, is_error = future.result()
-            with counters_lock:
-                counters["done"] += 1
-                if output == "True":
-                    counters["true_count"] += 1
-                if is_error:
-                    counters["errors"] += 1
-                snapshot = dict(counters)
-            if progress_cb:
-                progress_cb(snapshot["done"], total_combos, snapshot["true_count"], snapshot["errors"])
-
-    return total_combos, counters["true_count"], counters["errors"]
+    return total_combos, true_count, errors
 
 
-def process_file(vasp_file_path, true_files_dir, sequence_map, max_workers, stream_cb=None, progress_cb=None):
+def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, progress_cb=None):
     if stream_cb:
         stream_cb(f"===== Discovery pass for {os.path.basename(vasp_file_path)} =====")
 
@@ -396,11 +375,10 @@ def process_file(vasp_file_path, true_files_dir, sequence_map, max_workers, stre
 
     if stream_cb:
         n_combos = len(list(itertools.product(*element_input_array))) if element_input_array else 1
-        stream_cb(f"===== Running {n_combos} combination(s) for {os.path.basename(vasp_file_path)} "
-                   f"(up to {max_workers} in parallel) =====")
+        stream_cb(f"===== Running {n_combos} combination(s) for {os.path.basename(vasp_file_path)} =====")
 
     total, true_count, errors = generate_input_combinations(
-        vasp_file_path, element_input_array, max_workers, stream_cb, progress_cb
+        vasp_file_path, element_input_array, stream_cb, progress_cb
     )
 
     result = {
@@ -514,23 +492,6 @@ for key, default in [
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
-
-# --------------------------------------------------------------------------
-# Sidebar: performance settings
-# --------------------------------------------------------------------------
-
-with st.sidebar:
-    st.subheader("⚙️ Run settings")
-    max_workers = st.slider(
-        "Parallel amcheck workers",
-        min_value=1, max_value=16, value=DEFAULT_MAX_WORKERS,
-        help="How many u/d spin combinations to run at once. Higher is faster "
-             "but uses more CPU/RAM on the server — start around 4–8.",
-    )
-    st.caption(
-        "Each amcheck run is its own subprocess, so running several combinations "
-        "concurrently is usually the single biggest speed-up available."
-    )
 
 st.divider()
 
@@ -707,7 +668,7 @@ if run_clicked:
                      f"({trues} True so far, {errors} errors)",
             )
 
-        result = process_file(path, true_files_dir, sequence_map, max_workers, stream_cb, progress_cb)
+        result = process_file(path, true_files_dir, sequence_map, stream_cb, progress_cb)
         st.session_state.results.append(result)
         results_box.dataframe(st.session_state.results, use_container_width=True, hide_index=True)
 
