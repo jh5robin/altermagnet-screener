@@ -2,19 +2,34 @@
 Altermagnet Screener — Streamlit app (Materials Project integration)
 ------------------------------------------------------------------
 Search structures directly from the Materials Project database, or upload
-your own VASP files, then this app drives `amcheck` interactively across
+your own VASP files, then this app drives `amcheck` (in parallel) across
 every u/d spin combination for magnetic elements, flagging any structure
 where at least one combination reports `Altermagnet? True`.
+
+Performance notes vs. the original version:
+  * amcheck availability check is cached (st.cache_resource) instead of
+    re-spawning a subprocess on every Streamlit rerun.
+  * amcheck runs for different u/d combinations are executed concurrently
+    with a thread pool (subprocess.Popen releases the GIL while waiting on
+    I/O, so this gives a near-linear speedup with worker count).
+  * Live terminal output is throttled (batched by line-count + time) and
+    kept in a bounded deque, instead of re-joining/re-escaping the full
+    scrollback on every single printed line.
 """
 
+import collections
 import itertools
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pandas as pd
 import streamlit as st
 
 # --------------------------------------------------------------------------
@@ -33,11 +48,18 @@ PRIMITIVE_CELL_PROMPT = "Do you want to use it instead? (Y/n)"
 
 SUBPROCESS_TIMEOUT_SECONDS = 120
 
+TERMINAL_MAX_LINES = 500
+TERMINAL_FLUSH_EVERY_N_LINES = 15
+TERMINAL_FLUSH_EVERY_SECONDS = 0.35
+
+DEFAULT_MAX_WORKERS = 4
+
 
 # --------------------------------------------------------------------------
-# amcheck availability
+# amcheck availability (cached — was re-run on every Streamlit rerun before)
 # --------------------------------------------------------------------------
 
+@st.cache_resource(show_spinner=False)
 def check_amcheck_installed() -> bool:
     try:
         subprocess.run(
@@ -117,7 +139,50 @@ def structure_to_poscar_text(structure) -> str:
 
 
 # --------------------------------------------------------------------------
-# Core subprocess runner with live streaming
+# Throttled terminal buffer (thread-safe)
+# --------------------------------------------------------------------------
+
+class ThrottledTerminal:
+    """Buffers lines from (possibly concurrent) amcheck runs and flushes to
+    the UI at most every N lines or every T seconds, instead of on every
+    single printed line. This is what keeps the UI responsive when a run
+    produces thousands of lines of output."""
+
+    def __init__(self, render_cb):
+        self._lines = collections.deque(maxlen=TERMINAL_MAX_LINES)
+        self._render_cb = render_cb
+        self._lock = threading.Lock()
+        self._since_flush = 0
+        self._last_flush = 0.0
+        self.all_lines = []  # full log kept for the downloadable file
+
+    def write(self, line: str):
+        with self._lock:
+            self._lines.append(line)
+            self.all_lines.append(line)
+            self._since_flush += 1
+            now = time.monotonic()
+            should_flush = (
+                self._since_flush >= TERMINAL_FLUSH_EVERY_N_LINES
+                or (now - self._last_flush) >= TERMINAL_FLUSH_EVERY_SECONDS
+            )
+            if should_flush:
+                snapshot = list(self._lines)
+                self._since_flush = 0
+                self._last_flush = now
+            else:
+                snapshot = None
+        if snapshot is not None:
+            self._render_cb(snapshot)
+
+    def flush_final(self):
+        with self._lock:
+            snapshot = list(self._lines)
+        self._render_cb(snapshot)
+
+
+# --------------------------------------------------------------------------
+# Core subprocess runner
 # --------------------------------------------------------------------------
 
 class AmcheckRunResult:
@@ -247,28 +312,48 @@ def run_amcheck(vasp_file_path: str, input_array: list, stream_cb=None):
     return altermagnet_result["value"], run_result
 
 
-def generate_input_combinations(vasp_file_path, arr, stream_cb=None, progress_cb=None):
-    total = 0
-    true_count = 0
-    errors = 0
+def generate_input_combinations(vasp_file_path, arr, max_workers, stream_cb=None, progress_cb=None):
+    """Runs every u/d combination concurrently via a thread pool.
+
+    subprocess.Popen blocks on I/O (waiting for the child process), which
+    releases the GIL, so a thread pool gives real parallel speedup here even
+    though Python threads don't parallelize pure-CPU work.
+    """
     combos = list(itertools.product(*arr)) if arr else [()]
+    total_combos = len(combos)
 
-    for combo in combos:
-        total += 1
+    counters = {"done": 0, "true_count": 0, "errors": 0}
+    counters_lock = threading.Lock()
+
+    def _run_one(combo):
         output, run_result = run_amcheck(vasp_file_path, list(combo), stream_cb)
-        if output == "True":
-            true_count += 1
-        if run_result.exception or run_result.timed_out or (
-            run_result.returncode not in (0, None) and output is None
-        ):
-            errors += 1
-        if progress_cb:
-            progress_cb(total, len(combos), true_count, errors)
+        is_error = bool(
+            run_result.exception or run_result.timed_out or (
+                run_result.returncode not in (0, None) and output is None
+            )
+        )
+        return output, is_error
 
-    return total, true_count, errors
+    workers = max(1, min(max_workers, total_combos))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_run_one, combo): combo for combo in combos}
+        for future in as_completed(futures):
+            output, is_error = future.result()
+            with counters_lock:
+                counters["done"] += 1
+                if output == "True":
+                    counters["true_count"] += 1
+                if is_error:
+                    counters["errors"] += 1
+                snapshot = dict(counters)
+            if progress_cb:
+                progress_cb(snapshot["done"], total_combos, snapshot["true_count"], snapshot["errors"])
+
+    return total_combos, counters["true_count"], counters["errors"]
 
 
-def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, progress_cb=None):
+def process_file(vasp_file_path, true_files_dir, sequence_map, max_workers, stream_cb=None, progress_cb=None):
     if stream_cb:
         stream_cb(f"===== Discovery pass for {os.path.basename(vasp_file_path)} =====")
 
@@ -311,10 +396,11 @@ def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, p
 
     if stream_cb:
         n_combos = len(list(itertools.product(*element_input_array))) if element_input_array else 1
-        stream_cb(f"===== Running {n_combos} combination(s) for {os.path.basename(vasp_file_path)} =====")
+        stream_cb(f"===== Running {n_combos} combination(s) for {os.path.basename(vasp_file_path)} "
+                   f"(up to {max_workers} in parallel) =====")
 
     total, true_count, errors = generate_input_combinations(
-        vasp_file_path, element_input_array, stream_cb, progress_cb
+        vasp_file_path, element_input_array, max_workers, stream_cb, progress_cb
     )
 
     result = {
@@ -342,30 +428,73 @@ st.set_page_config(page_title="Altermagnet Screener", page_icon="🧲", layout="
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 2.2rem;}
-    div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+    .block-container {padding-top: 2rem; max-width: 1200px;}
+    div[data-testid="stMetricValue"] {font-size: 1.7rem; font-weight: 700;}
+    div[data-testid="stMetric"] {
+        background: rgba(148, 163, 184, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 12px;
+        padding: 0.75rem 1rem;
+    }
+
+    .am-hero {
+        background: linear-gradient(120deg, #4338ca 0%, #7c3aed 45%, #db2777 100%);
+        border-radius: 16px;
+        padding: 1.6rem 1.8rem;
+        margin-bottom: 1.4rem;
+        color: white;
+    }
+    .am-hero h1 {
+        margin: 0 0 0.35rem 0;
+        font-size: 1.9rem;
+        color: white;
+    }
+    .am-hero p {
+        margin: 0;
+        opacity: 0.92;
+        font-size: 0.98rem;
+    }
+
     .terminal-box {
         background-color: #0d1117;
         color: #c9d1d9;
         font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
-        font-size: 0.8rem;
+        font-size: 0.78rem;
         padding: 1rem;
-        border-radius: 8px;
+        border-radius: 10px;
         height: 340px;
         overflow-y: auto;
         white-space: pre-wrap;
         border: 1px solid #30363d;
+        line-height: 1.45;
     }
+
+    .badge {
+        display: inline-block;
+        padding: 0.15rem 0.6rem;
+        border-radius: 999px;
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .badge-flagged {background: rgba(219, 39, 119, 0.15); color: #db2777; border: 1px solid rgba(219,39,119,0.35);}
+    .badge-clean {background: rgba(16, 185, 129, 0.12); color: #059669; border: 1px solid rgba(16,185,129,0.3);}
+    .badge-error {background: rgba(239, 68, 68, 0.12); color: #dc2626; border: 1px solid rgba(239,68,68,0.3);}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🧲 Altermagnet Screener")
-st.caption(
-    "Search a structure from the Materials Project, or upload your own VASP files. "
-    "This app runs `amcheck` across every u/d spin combination for magnetic elements "
-    "and flags any structure with at least one combination where **Altermagnet? True**."
+st.markdown(
+    """
+    <div class="am-hero">
+        <h1>🧲 Altermagnet Screener</h1>
+        <p>Search a structure from the Materials Project, or upload your own VASP files.
+        This app runs <code>amcheck</code> in parallel across every u/d spin combination
+        for magnetic elements and flags any structure with at least one combination
+        where <b>Altermagnet? True</b>.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 amcheck_ok = check_amcheck_installed()
@@ -386,6 +515,23 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+# --------------------------------------------------------------------------
+# Sidebar: performance settings
+# --------------------------------------------------------------------------
+
+with st.sidebar:
+    st.subheader("⚙️ Run settings")
+    max_workers = st.slider(
+        "Parallel amcheck workers",
+        min_value=1, max_value=16, value=DEFAULT_MAX_WORKERS,
+        help="How many u/d spin combinations to run at once. Higher is faster "
+             "but uses more CPU/RAM on the server — start around 4–8.",
+    )
+    st.caption(
+        "Each amcheck run is its own subprocess, so running several combinations "
+        "concurrently is usually the single biggest speed-up available."
+    )
+
 st.divider()
 
 # --------------------------------------------------------------------------
@@ -405,30 +551,37 @@ with tab_mp:
 
     api_key = st.text_input("Materials Project API key", type="password", key="mp_api_key")
 
-    search_col1, search_col2 = st.columns([1, 2])
-    with search_col1:
-        search_mode = st.radio(
-            "Search by", ["Formula", "Chemical system (e.g. Fe-O)", "Material ID"],
-        )
-    with search_col2:
-        placeholder = {
-            "Formula": "e.g. Fe2O3",
-            "Chemical system (e.g. Fe-O)": "e.g. Fe-O",
-            "Material ID": "e.g. mp-19770 (comma-separate for several)",
-        }[search_mode]
-        query = st.text_input("Query", placeholder=placeholder)
+    # Wrapped in a form so typing the query doesn't trigger a rerun on every
+    # keystroke — only "Search" submits.
+    with st.form("mp_search_form"):
+        search_col1, search_col2 = st.columns([1, 2])
+        with search_col1:
+            search_mode = st.radio(
+                "Search by", ["Formula", "Chemical system (e.g. Fe-O)", "Material ID"],
+            )
+        with search_col2:
+            placeholder = {
+                "Formula": "e.g. Fe2O3",
+                "Chemical system (e.g. Fe-O)": "e.g. Fe-O",
+                "Material ID": "e.g. mp-19770 (comma-separate for several)",
+            }[search_mode]
+            query = st.text_input("Query", placeholder=placeholder)
+        search_submitted = st.form_submit_button("Search", disabled=not amcheck_ok)
 
-    if st.button("Search", disabled=not api_key or not query):
-        try:
-            with st.spinner("Searching Materials Project..."):
-                docs = mp_search(api_key, search_mode, query)
-            if not docs:
-                st.warning("No matching structures found.")
-            else:
-                st.session_state.mp_docs = {d.material_id: d for d in docs}
-                st.success(f"Found {len(docs)} structure(s).")
-        except Exception as e:
-            st.error(f"Search failed: {e}")
+    if search_submitted:
+        if not api_key or not query:
+            st.warning("Enter both an API key and a query.")
+        else:
+            try:
+                with st.spinner("Searching Materials Project..."):
+                    docs = mp_search(api_key, search_mode, query)
+                if not docs:
+                    st.warning("No matching structures found.")
+                else:
+                    st.session_state.mp_docs = {d.material_id: d for d in docs}
+                    st.success(f"Found {len(docs)} structure(s).")
+            except Exception as e:
+                st.error(f"Search failed: {e}")
 
     if st.session_state.mp_docs:
         table_rows = []
@@ -440,7 +593,7 @@ with tab_mp:
                 "Energy above hull (eV/atom)": round(d.energy_above_hull, 4) if d.energy_above_hull is not None else None,
                 "Sites": d.nsites,
             })
-        st.dataframe(table_rows, use_container_width=True)
+        st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
         options = [f"{mid} — {d.formula_pretty}" for mid, d in st.session_state.mp_docs.items()]
         selected = st.multiselect("Select structure(s) to add to the analysis queue", options)
@@ -523,21 +676,22 @@ if run_clicked:
     file_progress = st.progress(0.0, text="")
 
     st.subheader("🖥 Live terminal output")
-    terminal_lines = []
     terminal_box = st.empty()
     terminal_box.markdown('<div class="terminal-box"></div>', unsafe_allow_html=True)
 
     results_box = st.empty()
 
-    def stream_cb(line):
-        terminal_lines.append(line)
-        display_text = "\n".join(terminal_lines[-500:])
+    def render_terminal(snapshot_lines):
+        display_text = "\n".join(snapshot_lines)
         display_text = (
             display_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         )
         terminal_box.markdown(
             f'<div class="terminal-box">{display_text}</div>', unsafe_allow_html=True
         )
+
+    terminal = ThrottledTerminal(render_terminal)
+    stream_cb = terminal.write
 
     for i, path in enumerate(file_paths):
         overall_progress.progress(
@@ -553,14 +707,15 @@ if run_clicked:
                      f"({trues} True so far, {errors} errors)",
             )
 
-        result = process_file(path, true_files_dir, sequence_map, stream_cb, progress_cb)
+        result = process_file(path, true_files_dir, sequence_map, max_workers, stream_cb, progress_cb)
         st.session_state.results.append(result)
-        results_box.dataframe(st.session_state.results, use_container_width=True)
+        results_box.dataframe(st.session_state.results, use_container_width=True, hide_index=True)
 
+    terminal.flush_final()
     overall_progress.progress(1.0, text="Done!")
     file_progress.progress(1.0, text="")
 
-    st.session_state.full_log = terminal_lines
+    st.session_state.full_log = terminal.all_lines
     st.session_state.true_files_dir = true_files_dir
     shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -574,12 +729,28 @@ if st.session_state.results:
 
     n_files = len(st.session_state.results)
     n_flagged = sum(1 for r in st.session_state.results if r.get("Flagged"))
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Files processed", n_files)
-    m2.metric("Flagged as altermagnetic", n_flagged)
-    m3.metric("Flag rate", f"{(n_flagged / n_files * 100):.0f}%" if n_files else "0%")
+    n_errors = sum(1 for r in st.session_state.results if "error" in str(r.get("Status", "")).lower())
 
-    st.dataframe(st.session_state.results, use_container_width=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Files processed", n_files)
+    m2.metric("🧲 Flagged as altermagnetic", n_flagged)
+    m3.metric("Flag rate", f"{(n_flagged / n_files * 100):.0f}%" if n_files else "0%")
+    m4.metric("⚠️ Errors", n_errors)
+
+    def badge_for(row):
+        if row.get("Flagged"):
+            return '<span class="badge badge-flagged">🧲 Flagged</span>'
+        if "error" in str(row.get("Status", "")).lower() or row.get("Status") == "Error":
+            return '<span class="badge badge-error">Error</span>'
+        return '<span class="badge badge-clean">Clean</span>'
+
+    df = pd.DataFrame(st.session_state.results)
+    if not df.empty:
+        df.insert(1, "", [badge_for(r) for r in st.session_state.results])
+        st.markdown(
+            df.to_html(escape=False, index=False),
+            unsafe_allow_html=True,
+        )
 
     true_files_dir = st.session_state.true_files_dir
     dl_col1, dl_col2 = st.columns(2)
