@@ -596,23 +596,20 @@ st.divider()
 tab_mp, tab_upload = st.tabs(["🔍 Search Materials Project", "📁 Upload files"])
 
 with tab_mp:
-    with st.expander("Where do I get an API key?", expanded=False):
-        st.markdown(
-            "1. Go to **[next-gen.materialsproject.org](https://next-gen.materialsproject.org)** "
-            "and log in (free account).\n"
-            "2. Open your **Dashboard** — your API key is shown there.\n"
-            "3. Paste it below. It's only kept in this browser session, never stored on disk."
-        )
-
     saved_api_key = get_saved_mp_api_key()
-    api_key = st.text_input(
-        "Materials Project API key",
-        type="password",
-        value=saved_api_key,
-        key="mp_api_key",
-    )
+
     if saved_api_key:
-        st.caption("🔑 Using the saved API key from `.streamlit/secrets.toml` — no need to paste it each time. Override above if you want to use a different key for this session.")
+        api_key = saved_api_key
+        st.caption("🔑 API key loaded from saved secrets.")
+    else:
+        with st.expander("Where do I get an API key?", expanded=False):
+            st.markdown(
+                "1. Go to **[next-gen.materialsproject.org](https://next-gen.materialsproject.org)** "
+                "and log in (free account).\n"
+                "2. Open your **Dashboard** — your API key is shown there.\n"
+                "3. Paste it below. It's only kept in this browser session, never stored on disk."
+            )
+        api_key = st.text_input("Materials Project API key", type="password", key="mp_api_key")
 
     # Wrapped in a form so typing the query doesn't trigger a rerun on every
     # keystroke — only "Search" submits.
@@ -683,7 +680,7 @@ with tab_mp:
                             })
                             st.rerun()
 
-                with st.expander(f"🔬 Structure — {mid_str}", expanded=True):
+                with st.expander(f"🔬 Structure — {mid_str}", expanded=False):
                     cif_text = structure_to_cif_text(d.structure)
                     render_structure_viewer(cif_text, key=mid_str)
                     st.caption("Rendered directly from the Materials Project structure data • drag to rotate • scroll to zoom • double-click to spin")
