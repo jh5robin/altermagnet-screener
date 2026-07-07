@@ -18,6 +18,19 @@ Performance notes vs. the original version:
     stalls (no output) or overruns a hard cap, it is killed automatically
     and the screener moves on to the next combination/file instead of
     hanging the whole app.
+
+Bugfix notes:
+  * The Materials Project "Query" text_input now has an explicit, stable
+    `key`. Previously it relied on Streamlit's auto-derived widget key,
+    which is generated from the widget's arguments — including the
+    `placeholder`, which changes depending on the selected search mode
+    (Formula / Chemical system / Material ID). Because the search inputs
+    live inside an `st.form`, the script doesn't rerun until the form is
+    submitted, so switching modes silently changed the widget's identity
+    right at submit time and the previously typed query was lost, causing
+    a false "Enter both an API key and a query" warning for any mode other
+    than the default ("Formula"). Giving it a fixed `key="mp_query_input"`
+    fixes this.
 """
 
 import collections
@@ -680,6 +693,7 @@ with tab_mp:
         with search_col1:
             search_mode = st.radio(
                 "Search by", ["Formula", "Chemical system (e.g. Fe-O)", "Material ID"],
+                key="mp_search_mode",
             )
         with search_col2:
             placeholder = {
@@ -687,7 +701,16 @@ with tab_mp:
                 "Chemical system (e.g. Fe-O)": "e.g. Fe-O",
                 "Material ID": "e.g. mp-19770 (comma-separate for several)",
             }[search_mode]
-            query = st.text_input("Query", placeholder=placeholder)
+            # NOTE: this widget MUST have a fixed, explicit key. Without one,
+            # Streamlit auto-derives the widget's identity from all of its
+            # arguments — including `placeholder`, which changes with
+            # `search_mode`. Because this lives inside an st.form, the script
+            # doesn't rerun until submission, so switching modes silently
+            # swapped the widget's identity right at submit time and any
+            # text the user had typed was lost (empty query -> the
+            # "Enter both an API key and a query" warning below, even though
+            # the user had typed something). A fixed key fixes this.
+            query = st.text_input("Query", placeholder=placeholder, key="mp_query_input")
         search_submitted = st.form_submit_button("Search", disabled=not amcheck_ok)
 
     if search_submitted:
