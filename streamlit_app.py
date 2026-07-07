@@ -662,7 +662,7 @@ with tab_mp:
 
     if saved_api_key:
         api_key = saved_api_key
-        st.caption("🔑 API key loaded from saved secrets.")
+        st.caption("")
     else:
         with st.expander("Where do I get an API key?", expanded=False):
             st.markdown(
