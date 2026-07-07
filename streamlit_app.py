@@ -12,8 +12,11 @@ Performance notes vs. the original version:
   * Live terminal output is throttled (batched by line-count + time) and
     kept in a bounded deque, instead of re-joining/re-escaping the full
     scrollback on every single printed line.
-  * amcheck combinations still run sequentially, one at a time, in the same
-    order as the original script.
+  * amcheck combinations can now run several at a time via a thread pool
+    (each combination still launches its own independent `amcheck`
+    subprocess, so this is a real parallel speedup, not just I/O overlap).
+    Defaults to a conservative worker count and is adjustable in the UI —
+    keep it low on shared/free hosting, raise it on a dedicated host.
   * amcheck subprocess reads now go through a watchdog thread: if a run
     stalls (no output) or overruns a hard cap, it is killed automatically
     and the screener moves on to the next combination/file instead of
@@ -21,6 +24,7 @@ Performance notes vs. the original version:
 """
 
 import collections
+import concurrent.futures
 import itertools
 import os
 import queue
@@ -34,6 +38,15 @@ import zipfile
 
 import pandas as pd
 import streamlit as st
+
+try:
+    # Needed so UI calls (progress bars, the live terminal) made from
+    # worker threads during parallel amcheck runs are correctly attributed
+    # to this session instead of silently no-op'ing or warning.
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except ImportError:  # pragma: no cover - API path differs across Streamlit versions
+    add_script_run_ctx = None
+    get_script_run_ctx = None
 
 # --------------------------------------------------------------------------
 # Constants
@@ -55,6 +68,14 @@ SUBPROCESS_TIMEOUT_SECONDS = 120
 # it's stuck on a prompt we don't recognize (or otherwise wedged) and kill
 # it rather than let it block the run forever.
 SUBPROCESS_STALL_TIMEOUT_SECONDS = 30
+
+# How many amcheck combinations run concurrently by default, and the cap the
+# UI slider allows. Kept conservative because each worker spawns its own
+# amcheck process — on a resource-capped host (e.g. Streamlit Community
+# Cloud's free tier, ~1GB RAM / shared CPU), too many at once can trip the
+# platform's own resource limit rather than speed anything up.
+DEFAULT_PARALLEL_WORKERS = 2
+MAX_PARALLEL_WORKERS = 6
 
 TERMINAL_MAX_LINES = 500
 TERMINAL_FLUSH_EVERY_N_LINES = 15
@@ -416,34 +437,72 @@ def run_amcheck(vasp_file_path: str, input_array: list, stream_cb=None):
     return altermagnet_result["value"], run_result
 
 
-def generate_input_combinations(vasp_file_path, arr, stream_cb=None, progress_cb=None):
-    """Runs every u/d combination one at a time, in order."""
+def generate_input_combinations(vasp_file_path, arr, stream_cb=None, progress_cb=None, max_workers=1):
+    """Runs every u/d combination, up to `max_workers` at a time.
+
+    Each combination is fully independent (its own amcheck subprocess,
+    its own stdin/stdout), so they parallelize cleanly via a thread pool.
+    Threads — not processes — are enough here because the actual work
+    happens inside the separate `amcheck` OS processes; Python's GIL isn't
+    the bottleneck, subprocess I/O is.
+
+    max_workers=1 reproduces the original strictly-sequential behavior
+    (including combination order). max_workers>1 processes combinations
+    concurrently, so terminal lines from different combinations may
+    interleave — each line is tagged with its combination index to keep
+    the log readable.
+    """
     combos = list(itertools.product(*arr)) if arr else [()]
     total_combos = len(combos)
+    max_workers = max(1, min(max_workers, total_combos)) if total_combos else 1
 
-    total = 0
-    true_count = 0
-    errors = 0
+    counters_lock = threading.Lock()
+    counters = {"total": 0, "true_count": 0, "errors": 0}
+    main_ctx = get_script_run_ctx() if get_script_run_ctx else None
 
-    for combo in combos:
-        total += 1
-        output, run_result = run_amcheck(vasp_file_path, list(combo), stream_cb)
-        if output == "True":
-            true_count += 1
-        if (
-            run_result.exception
-            or run_result.timed_out
-            or run_result.stalled
-            or (run_result.returncode not in (0, None) and output is None)
-        ):
-            errors += 1
-        if progress_cb:
-            progress_cb(total, total_combos, true_count, errors)
+    def run_one(combo_idx, combo):
+        if add_script_run_ctx and main_ctx:
+            # Attach this session's Streamlit context to the worker thread so
+            # progress_cb / stream_cb can safely touch the UI from here.
+            add_script_run_ctx(threading.current_thread(), main_ctx)
 
-    return total_combos, true_count, errors
+        def tagged_stream_cb(line):
+            if stream_cb:
+                stream_cb(f"[combo {combo_idx}/{total_combos}] {line}")
+
+        output, run_result = run_amcheck(
+            vasp_file_path, list(combo), tagged_stream_cb if stream_cb else None
+        )
+
+        with counters_lock:
+            counters["total"] += 1
+            if output == "True":
+                counters["true_count"] += 1
+            if (
+                run_result.exception
+                or run_result.timed_out
+                or run_result.stalled
+                or (run_result.returncode not in (0, None) and output is None)
+            ):
+                counters["errors"] += 1
+            if progress_cb:
+                progress_cb(
+                    counters["total"], total_combos, counters["true_count"], counters["errors"]
+                )
+
+    if max_workers <= 1:
+        for i, combo in enumerate(combos, start=1):
+            run_one(i, combo)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_one, i, combo) for i, combo in enumerate(combos, start=1)]
+            for f in concurrent.futures.as_completed(futures):
+                f.result()  # re-raise any unexpected exception from a worker
+
+    return total_combos, counters["true_count"], counters["errors"]
 
 
-def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, progress_cb=None):
+def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, progress_cb=None, max_workers=1):
     if stream_cb:
         stream_cb(f"===== Discovery pass for {os.path.basename(vasp_file_path)} =====")
 
@@ -491,7 +550,7 @@ def process_file(vasp_file_path, true_files_dir, sequence_map, stream_cb=None, p
         stream_cb(f"===== Running {n_combos} combination(s) for {os.path.basename(vasp_file_path)} =====")
 
     total, true_count, errors = generate_input_combinations(
-        vasp_file_path, element_input_array, stream_cb, progress_cb
+        vasp_file_path, element_input_array, stream_cb, progress_cb, max_workers=max_workers
     )
 
     result = {
@@ -623,7 +682,7 @@ st.markdown(
     <div class="am-hero">
         <h1>🧲 Altermagnet Screener</h1>
         <p>Search a structure from the Materials Project, or upload your own VASP files.
-        Click any result and add it to the queue — then run
+        Click any result to view it in 3D and add it to the queue — then run
         <code>amcheck</code> across every u/d spin combination for magnetic elements,
         and get flagged the moment one comes back <b>Altermagnet? True</b>.</p>
     </div>
@@ -662,7 +721,7 @@ with tab_mp:
 
     if saved_api_key:
         api_key = saved_api_key
-        st.caption("")
+        st.caption("🔑 API key loaded from saved secrets.")
     else:
         with st.expander("Where do I get an API key?", expanded=False):
             st.markdown(
@@ -780,6 +839,28 @@ with tab_upload:
 
 st.divider()
 
+perf_col1, perf_col2 = st.columns([1, 2])
+with perf_col1:
+    parallel_workers = st.slider(
+        "Parallel amcheck workers",
+        min_value=1,
+        max_value=MAX_PARALLEL_WORKERS,
+        value=DEFAULT_PARALLEL_WORKERS,
+        help=(
+            "Runs this many u/d combinations concurrently instead of one at a time. "
+            "Each worker spawns its own amcheck process. On Streamlit Community "
+            "Cloud's free tier (shared CPU, ~1GB RAM cap), keep this at 2-3 — going "
+            "higher risks tripping the platform's own resource limit instead of "
+            "speeding anything up. On a dedicated VPS with more cores/RAM, you can "
+            "raise this."
+        ),
+    )
+with perf_col2:
+    st.caption(
+        f"{parallel_workers} worker(s) selected. Start low, watch that the app "
+        "stays responsive, then increase if you have the headroom."
+    )
+
 run_col, clear_col = st.columns([1, 1])
 run_clicked = run_col.button("▶ Run analysis", type="primary", disabled=not amcheck_ok)
 clear_clicked = clear_col.button("🗑 Clear results")
@@ -862,7 +943,9 @@ if run_clicked:
                      f"({trues} True so far, {errors} errors)",
             )
 
-        result = process_file(path, true_files_dir, sequence_map, stream_cb, progress_cb)
+        result = process_file(
+            path, true_files_dir, sequence_map, stream_cb, progress_cb, max_workers=parallel_workers
+        )
         st.session_state.results.append(result)
         results_box.dataframe(st.session_state.results, use_container_width=True, hide_index=True)
 
